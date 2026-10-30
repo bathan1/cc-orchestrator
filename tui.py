@@ -193,6 +193,11 @@ class LanguageScreen(TranslatedModalScreen):
                 yield Button(tr("Apply"), id="apply-language", variant="primary")
                 yield Button(tr("Cancel"), id="cancel-language")
 
+    def on_select_changed(self, event: Select.Changed):
+        if event.select.id == "language-choice" and event.value in tui_i18n.LANGUAGES:
+            self.query_one("#apply-language", Button).label = tr("Apply", language=event.value)
+            self.query_one("#cancel-language", Button).label = tr("Cancel", language=event.value)
+
     def on_button_pressed(self, event):
         if event.button.id == "apply-language":
             self.dismiss(self.query_one("#language-choice", Select).value)

@@ -25,18 +25,22 @@ def get_language():
     return _language
 
 
-def tr(message):
-    """`tr(message)` is MESSAGE in the selected language, with the English source as fallback.
+def tr(message, *, language=None):
+    """`tr(message, language=None)` is MESSAGE in LANGUAGE, with the English source as fallback.
 
-    Translate literal templates before formatting them with user content.
+    Omitted LANGUAGE uses the active TUI language; an explicit language does not
+    change it. Translate literal templates before formatting them with user content.
     """
-    if _language not in _catalogs:
+    language = _language if language is None else language
+    if language not in LANGUAGES:
+        language = DEFAULT_LANGUAGE
+    if language not in _catalogs:
         try:
-            catalog = json.loads((CATALOG_DIR / f"{_language}.json").read_text(encoding="utf-8"))
+            catalog = json.loads((CATALOG_DIR / f"{language}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             catalog = {}
-        _catalogs[_language] = catalog if isinstance(catalog, dict) else {}
-    translated = _catalogs[_language].get(message)
+        _catalogs[language] = catalog if isinstance(catalog, dict) else {}
+    translated = _catalogs[language].get(message)
     return translated if isinstance(translated, str) and translated else message
 
 

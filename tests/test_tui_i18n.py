@@ -50,6 +50,8 @@ class CatalogTests(unittest.TestCase):
     def test_language_lookup_and_fallback(self):
         i18n.set_language("ru")
         self.assertEqual(i18n.tr("Cancel"), "Отмена")
+        self.assertEqual(i18n.tr("Cancel", language="en"), "Cancel")
+        self.assertEqual(i18n.get_language(), "ru")
         self.assertEqual(i18n.tr("Missing %s") % "Русский project", "Missing Русский project")
         i18n.set_language("en")
         self.assertEqual(i18n.tr("Cancel"), "Cancel")
@@ -117,6 +119,11 @@ class LanguagePickerTests(unittest.IsolatedAsyncioTestCase):
         await pilot.press("f2")
         self.assertIsInstance(app.screen, tui.LanguageScreen)
         app.screen.query_one("#language-choice", Select).value = code
+        await pilot.pause()
+        self.assertEqual(str(app.screen.query_one("#apply-language", Button).label),
+                         "Apply" if code == "en" else "Применить")
+        self.assertEqual(str(app.screen.query_one("#cancel-language", Button).label),
+                         "Cancel" if code == "en" else "Отмена")
         await pilot.click("#apply-language")
         await pilot.pause()
 
@@ -164,8 +171,15 @@ class LanguagePickerTests(unittest.IsolatedAsyncioTestCase):
         app = tui.CCApp(language_file=self.preferences)
         async with app.run_test(size=(100, 32)) as pilot:
             await pilot.press("f2")
-            app.screen.query_one(Select).value = "en"
-            await pilot.press("escape")
+            for code, apply_label, cancel_label in [("ru", "Применить", "Отмена"), ("en", "Apply", "Cancel"),
+                                                    ("ru", "Применить", "Отмена"), ("en", "Apply", "Cancel")]:
+                app.screen.query_one(Select).value = code
+                await pilot.pause()
+                self.assertEqual(str(app.screen.query_one("#apply-language", Button).label), apply_label)
+                self.assertEqual(str(app.screen.query_one("#cancel-language", Button).label), cancel_label)
+                self.assertEqual(i18n.get_language(), "ru")
+                self.assertFalse(self.preferences.exists())
+            await pilot.click("#cancel-language")
             self.assertEqual(i18n.get_language(), "ru")
             self.assertFalse(self.preferences.exists())
             with patch.object(i18n, "save_language", side_effect=OSError("read-only")), patch.object(app, "notify") as notify:
