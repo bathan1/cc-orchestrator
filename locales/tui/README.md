@@ -30,5 +30,11 @@ user-authored task names, Jira text, agent replies, logs, and subprocess output
 must retain their original values. Textual's built-in widget help and command
 palette are supplied by Textual and are not part of these catalogs.
 
+The Timeline and lost-task recovery panels render structured engine JSON with
+translated action names, field labels, and empty-state messages. Values from
+records and unknown action names stay intact. Lost-task details are translated
+in the main panel too. Other command output, including project-add diagnostics,
+is displayed verbatim.
+
 The language picker is available from the main screen. Finish or cancel an open
 dialog before switching; this avoids discarding any unsaved form input.

@@ -14,6 +14,7 @@ from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Footer, Tree, Static, Input, Button, Label, TextArea, Select
 from textual.binding import Binding
+from rich.markup import escape
 import threading
 
 ENGINE = str(Path(__file__).parent / "cc.py")
@@ -24,7 +25,47 @@ LEGEND = ("🟡 needs review   🔵 agent running   🟣 MR open   ✅ merged   
 
 _AUDIT_VERB = {"task.add": "created", "task.merge": "merged", "epic.mr": "epic MR→master",
                "jira.transition": "Jira", "repo.set": "repo set", "state.restore": "state restored",
-               "state.recover": "tasks recovered"}
+               "state.recover": "tasks recovered", "group.combine": "group combined",
+               "task.regroup": "task moved", "task.land": "task landed",
+               "task.memory": "task memory updated", "ops.start": "operation started"}
+
+_AUDIT_FIELD = {"repo": "repo", "base": "target", "mr": "MR", "url": "URL", "to": "to",
+                "key": "key", "branch": "branch", "default_branch": "default branch",
+                "remote": "remote", "title": "title", "repos": "repos", "skipped": "skipped",
+                "count": "count", "reason": "reason", "detail": "detail", "from": "from",
+                "included": "included", "op": "operation", "kind": "kind"}
+
+
+def _timeline_lines(output):
+    """`_timeline_lines(output)` is localized timeline text from the engine's JSON output."""
+    records = json.loads(output)
+    if not records:
+        return [tr("(timeline is empty — no actions recorded yet)")]
+    lines = []
+    for record in records:
+        timestamp = time.strftime("%H:%M %d.%m", time.localtime(record.get("ts", 0)))
+        action = record.get("action", "?")
+        verb = tr(_AUDIT_VERB[action]) if action in _AUDIT_VERB else action
+        who = record.get("task") or record.get("epic") or record.get("project") or ""
+        fields = []
+        for key, label in _AUDIT_FIELD.items():
+            if key in record:
+                value = record[key]
+                if isinstance(value, list):
+                    value = ",".join(map(str, value))
+                fields.append("%s=%s" % (tr(label), value))
+        lines.append("%s  %s  %s  %s" % (timestamp, verb, who, "  ".join(fields)))
+    return lines
+
+
+def _recovery_lines(output):
+    """`_recovery_lines(output)` is localized recovery results from the engine's JSON output."""
+    records = json.loads(output)
+    if not records:
+        return [tr("No lost tasks on disk to recover ✓")]
+    return [tr("Recovered %d tasks to the board:") % len(records),
+            *[tr("  %s   (epic %s, branch %s)") % tuple(record) for record in records], "",
+            tr("`cc task mrs <tid>` loads MRs; task names use the folder slug.")]
 
 def _audit_brief(r):
     """One compact human line for an audit record (used in the task detail's timeline block)."""
@@ -515,10 +556,11 @@ class OutputScreen(TranslatedModalScreen):
     BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close"),
                 Binding("o", "open_links", "Open links")]
 
-    def __init__(self, title, argv):
+    def __init__(self, title, argv, formatter=None):
         super().__init__()
         self._title = title
         self._argv = argv
+        self._formatter = formatter
         self._lines = []
 
     def action_open_links(self):
@@ -551,9 +593,22 @@ class OutputScreen(TranslatedModalScreen):
         try:
             proc = subprocess.Popen(self._argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, env=env)
+            output = []
             for line in proc.stdout:
-                self.app.call_from_thread(self._append, line.rstrip("\n"))
+                if self._formatter:
+                    output.append(line)
+                else:
+                    self.app.call_from_thread(self._append, line.rstrip("\n"))
             proc.wait()
+            if self._formatter:
+                lines = "".join(output).splitlines()
+                if proc.returncode == 0:
+                    try:
+                        lines = self._formatter("".join(output))
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                for line in lines:
+                    self.app.call_from_thread(self._append, line)
             tail = tr("✓ done (exit 0)") if proc.returncode == 0 else tr("✗ ERROR (exit %d)") % proc.returncode
         except Exception as ex:
             tail = tr("✗ Launch ERROR: %s") % ex
@@ -1287,6 +1342,9 @@ class CCApp(App):
             return "%s:%s" % (t, data["id"])
         if t == "orphans":
             return "orphans:"
+        if t == "orphan":
+            orphan = data["orphan"]
+            return "orphan:" + json.dumps([orphan[key] for key in ("project", "epic", "slug")])
         return None
 
     def _find_node(self, node, key):
@@ -1325,7 +1383,8 @@ class CCApp(App):
                                    data={"type": "orphans"}, expand=True)
                 for o in orphans:
                     on.add_leaf(tr("[yellow]%s / %s  (branch %s, %d repos)[/yellow]")
-                                % (o["epic"], o["slug"], o["branch"], len(o["repos"])), data=None)
+                                % (o["epic"], o["slug"], o["branch"], len(o["repos"])),
+                                data={"type": "orphan", "orphan": o})
         finally:
             self._building = False
         # Restore the cursor AFTER the tree re-renders: a freshly-added node has no line index yet
@@ -1466,6 +1525,18 @@ class CCApp(App):
             d.update("")
             return
         s = self.state()
+        if data["type"] in ("orphans", "orphan"):
+            orphans = [data["orphan"]] if data["type"] == "orphan" else cc._scan_orphans(s)
+            lines = [tr("[b]Lost tasks[/b] — %d tasks on disk missing from the board") % len(orphans), ""]
+            for orphan in orphans:
+                lines.append(tr("Project: %s · Epic: %s · Task: %s") % tuple(
+                    escape(str(orphan[key])) for key in ("project", "epic", "slug")))
+                lines.append(tr("Branch: %s") % escape(orphan["branch"]))
+                lines += ["  %s: %s" % (escape(repo), escape(path)) for repo, path in orphan["repos"].items()]
+                lines.append("")
+            lines.append(tr("[dim]U — recover lost tasks; existing worktrees and branches are preserved[/dim]"))
+            d.update("\n".join(lines))
+            return
         if data["type"] in ("taskgroup", "jiragroup"):
             d.update(tr("[dim]task group — expand and select a task[/dim]"))
             return
@@ -1628,7 +1699,7 @@ class CCApp(App):
     def action_recover(self):
         # restore tasks whose work is on disk but missing from the board
         self.push_screen(OutputScreen(tr("recover lost tasks"),
-                         [sys.executable, "-u", ENGINE, "recover"]),
+                         [sys.executable, "-u", ENGINE, "recover", "--json"], _recovery_lines),
                          lambda _: self.build_tree())
 
     def action_panel(self):
@@ -1684,13 +1755,13 @@ class CCApp(App):
     def action_timeline(self):
         # the 'what happened' log; context-aware — filtered to the focused task/epic, else everything
         cur = self.current()
-        argv = [sys.executable, "-u", ENGINE, "log", "-n", "150"]
+        argv = [sys.executable, "-u", ENGINE, "log", "-n", "150", "--json"]
         title = tr("timeline — all")
         if cur and cur.get("type") == "task":
             argv += ["--task", cur["id"]]; title = tr("timeline · task %s") % cur["id"]
         elif cur and cur.get("type") == "epic":
             argv += ["--epic", cur["id"]]; title = tr("timeline · epic %s") % cur["id"]
-        self.push_screen(OutputScreen(title, argv))
+        self.push_screen(OutputScreen(title, argv, _timeline_lines))
 
     def action_refresh(self):
         cur = self.current()
@@ -1778,13 +1849,7 @@ class CCApp(App):
         args = [sys.executable, ENGINE, "project", "add", res["path"]]
         if res["name"]:
             args.append(res["name"])
-        r = subprocess.run(args, capture_output=True, text=True)
-        if r.returncode != 0:
-            self.notify(tr("project add failed: %s") % r.stderr.strip()[:120], severity="error")
-        else:
-            line = r.stdout.strip().splitlines()[0] if r.stdout.strip() else tr("project added")
-            self.notify(line)
-        self.build_tree()
+        self.push_screen(OutputScreen(tr("Add project"), args), lambda _: self.build_tree())
 
     def action_new_epic(self):
         proj = self._current_project()

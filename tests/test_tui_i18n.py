@@ -1,13 +1,15 @@
 """Translation and headless language-picker tests, isolated from real user state."""
 
 import ast
+import asyncio
+import io
 import json
 from pathlib import Path
 import re
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -27,7 +29,7 @@ class CatalogTests(unittest.TestCase):
         catalogs = {code: json.loads((i18n.CATALOG_DIR / f"{code}.json").read_text())
                     for code in i18n.LANGUAGES}
         tree = ast.parse((ROOT / "tui.py").read_text())
-        messages = {tui.LEGEND, *tui._AUDIT_VERB.values()}
+        messages = {tui.LEGEND, *tui._AUDIT_VERB.values(), *tui._AUDIT_FIELD.values()}
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 if node.func.id == "tr" and isinstance(node.args[0], ast.Constant):
@@ -60,6 +62,24 @@ class CatalogTests(unittest.TestCase):
         with patch.dict(i18n._catalogs, {"ru": {"Cancel": None, "Apply": ""}}):
             self.assertEqual(i18n.tr("Cancel"), "Cancel")
             self.assertEqual(i18n.tr("Apply"), "Apply")
+
+    def test_timeline_and_recovery_preserve_user_content(self):
+        records = [{"ts": 1, "action": "task.add", "task": "t1", "title": "Сохранить [текст]",
+                    "repos": ["web", "api"], "branch": "feature"},
+                   {"ts": 2, "action": "future.action", "detail": "Original log"}]
+        for code, field in [("en", "title"), ("ru", "название")]:
+            i18n.set_language(code)
+            lines = "\n".join(tui._timeline_lines(json.dumps(records)))
+            self.assertIn(i18n.tr("created"), lines)
+            self.assertIn(field + "=Сохранить [текст]", lines)
+            self.assertIn("web,api", lines)
+            self.assertIn("future.action", lines)
+            self.assertIn("Original log", lines)
+            self.assertEqual(tui._timeline_lines("[]"), [i18n.tr("(timeline is empty — no actions recorded yet)")])
+            self.assertEqual(tui._recovery_lines("[]"), [i18n.tr("No lost tasks on disk to recover ✓")])
+            recovered = tui._recovery_lines(json.dumps([["t1", "E1", "feature"]]))
+            self.assertEqual(recovered[0], i18n.tr("Recovered %d tasks to the board:") % 1)
+            self.assertIn("feature", recovered[1])
 
     def test_missing_or_malformed_catalog(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(i18n, "CATALOG_DIR", Path(directory)):
@@ -206,6 +226,56 @@ class LanguagePickerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("feature", text)
                 self.assertIn("main", text)
                 await pilot.press("escape")
+
+    async def test_lost_tasks_details_switch_language_and_keep_selection(self):
+        orphan = {"project": "Русский project", "epic": "LOST", "slug": "ghost", "branch": "LOST-ghost",
+                  "repos": {"web": "/tmp/[worktree]/web"}}
+        app = tui.CCApp(language_file=self.preferences)
+        with patch.object(cc, "_scan_orphans", return_value=[orphan]):
+            async with app.run_test(size=(120, 40)) as pilot:
+                tree = app.query_one(Tree)
+                parent = tree.root.children[-1]
+                tree.move_cursor(parent)
+                await pilot.pause()
+                self.assertIn("Потерянные задачи", str(app.query_one("#detail", Static).render()))
+                tree.move_cursor(parent.children[0])
+                await pilot.pause()
+                for code, label in [("en", "Lost tasks"), ("ru", "Потерянные задачи")]:
+                    await self.choose(app, pilot, code)
+                    detail = str(app.query_one("#detail", Static).render())
+                    self.assertIn(label, detail)
+                    self.assertIn("/tmp/[worktree]/web", detail)
+                    self.assertEqual(app.current()["orphan"], orphan)
+
+    async def test_timeline_filters_and_project_errors_are_visible(self):
+        app = tui.CCApp(language="en", language_file=self.preferences)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for current, flag in [(None, None), ({"type": "task", "id": "t1"}, "--task"),
+                                  ({"type": "epic", "id": "E1"}, "--epic")]:
+                with patch.object(app, "current", return_value=current):
+                    app.action_timeline()
+                await pilot.pause()
+                screen = app.screen
+                self.assertIn("--json", screen._argv)
+                if flag:
+                    self.assertEqual(screen._argv[-2:], [flag, current["id"]])
+                proc = Mock(stdout=io.StringIO('[]\n'), returncode=0)
+                with patch.object(tui.subprocess, "Popen", return_value=proc):
+                    await asyncio.to_thread(screen._run)
+                self.assertIn("timeline is empty", str(screen.query_one("#ocontent", Static).render()))
+                await pilot.press("escape")
+            app._project_added({"path": "/tmp/project with spaces", "name": "demo"})
+            await pilot.pause()
+            screen = app.screen
+            self.assertEqual(screen._argv, [sys.executable, tui.ENGINE, "project", "add",
+                                           "/tmp/project with spaces", "demo"])
+            error = "Traceback:\n" + "stack frame\n" * 20 + "FileNotFoundError: missing executable\n"
+            with patch.object(tui.subprocess, "Popen", return_value=Mock(stdout=io.StringIO(error), returncode=1)):
+                await asyncio.to_thread(screen._run)
+            output = str(screen.query_one("#ocontent", Static).render())
+            self.assertIn("FileNotFoundError: missing executable", output)
+            self.assertIn("ERROR (exit 1)", output)
+            await pilot.press("escape")
 
 
 if __name__ == "__main__":
